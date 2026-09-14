@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: spacex-gesture-earth
+Version: 0.1.0
+Summary: Gesture-controlled 3D Earth renderer - pure Python with PyOpenGL + pygame
+Requires-Python: >=3.10
+Requires-Dist: pygame>=2.5.0
+Requires-Dist: PyOpenGL>=3.1.7
+Requires-Dist: PyOpenGL-accelerate>=3.1.7
+Requires-Dist: mediapipe==0.10.14
+Requires-Dist: opencv-python>=4.8.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: Pillow>=10.0.0
+Requires-Dist: pyttsx3>=2.90
