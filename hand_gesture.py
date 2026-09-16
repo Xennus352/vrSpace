@@ -34,6 +34,32 @@ class StableGestureSystem:
     def finger_down(self, tip, pip):
         return tip.y > pip.y
 
+    def _f_ext(self, landmarks, mcp_i, pip_i, tip_i):
+        mcp, pip, tip = landmarks[mcp_i], landmarks[pip_i], landmarks[tip_i]
+        ext = math.hypot(tip.x - mcp.x, tip.y - mcp.y, tip.z - mcp.z)
+        curl = math.hypot(pip.x - mcp.x, pip.y - mcp.y, pip.z - mcp.z)
+        return ext > curl * 1.15
+
+    def finger_extended(self, landmarks):
+        mcp = landmarks[5]
+        pip = landmarks[6]
+        tip = landmarks[8]
+        ext_len = math.hypot(tip.x - mcp.x, tip.y - mcp.y, tip.z - mcp.z)
+        curl_len = math.hypot(pip.x - mcp.x, pip.y - mcp.y, pip.z - mcp.z)
+        return ext_len > curl_len * 1.15
+
+    def pointing_direction(self, landmarks):
+        mcp = landmarks[5]
+        tip = landmarks[8]
+        dx = tip.x - mcp.x
+        dy = tip.y - mcp.y
+        adx, ady = abs(dx), abs(dy)
+        if adx < 0.015 and ady < 0.015:
+            return None
+        if ady > adx:
+            return "DOWN" if dy > 0 else "UP"
+        return "RIGHT" if dx > 0 else "LEFT"
+
     def normalize_handedness(self, label):
         if not self.swap_handedness:
             return label
@@ -58,10 +84,11 @@ class StableGestureSystem:
         pinky_tip = landmarks[20]
         pinky_pip = landmarks[18]
 
-        index_up  = self.finger_up(index_tip, index_pip)
-        middle_up = self.finger_up(middle_tip, middle_pip)
-        ring_up   = self.finger_up(ring_tip, ring_pip)
-        pinky_up  = self.finger_up(pinky_tip, pinky_pip)
+        # Direction-aware extension (works at ANY hand angle)
+        index_ext = self.finger_extended(landmarks)
+        middle_ext = self._f_ext(landmarks, 9, 10, 12)
+        ring_ext = self._f_ext(landmarks, 13, 14, 16)
+        pinky_ext = self._f_ext(landmarks, 17, 18, 20)
 
         # Better thumb logic (depends on hand side)
         if handedness == "Right":
@@ -73,11 +100,11 @@ class StableGestureSystem:
 
         # ---- PRIORITY ORDER ----
         # 1) THUMBS UP (must come before fist to avoid false fist detection)
-        if thumb_up and not index_up and not middle_up and not ring_up and not pinky_up:
+        if thumb_up and not index_ext and not middle_ext and not ring_ext and not pinky_ext:
             return "THUMBS_UP"
 
         # 2) OPEN PALM
-        if index_up and middle_up and ring_up and pinky_up:
+        if index_ext and middle_ext and ring_ext and pinky_ext:
             return "OPEN_PALM"
 
         # 3) PINCH (Click)
@@ -85,23 +112,24 @@ class StableGestureSystem:
             return "CLICK"
 
         # 4) VICTORY (index + middle up)
-        if index_up and middle_up and not ring_up and not pinky_up:
+        if index_ext and middle_ext and not ring_ext and not pinky_ext:
             return "VICTORY"
 
         # 5) THREE_FINGER_CLICK (index + middle + ring up)
-        if index_up and middle_up and ring_up and not pinky_up:
+        if index_ext and middle_ext and ring_ext and not pinky_ext:
             return "THREE_FINGER_CLICK"
 
         # 6) RIGHT_CLICK_G (middle finger up only)
-        if middle_up and not index_up and not ring_up and not pinky_up:
+        if middle_ext and not index_ext and not ring_ext and not pinky_ext:
             return "RIGHT_CLICK_G"
 
-        # 7) POINTING_UP
-        if index_up and not middle_up and not ring_up and not pinky_up:
-            return "POINTING_UP"
+        # 7) POINTING — index extended in ANY direction (up/down/left/right)
+        if index_ext and not middle_ext and not ring_ext and not pinky_ext:
+            direction = self.pointing_direction(landmarks)
+            return f"POINTING_{direction}" if direction else "POINTING_UP"
 
         # 8) FIST
-        if not index_up and not middle_up and not ring_up and not pinky_up:
+        if not index_ext and not middle_ext and not ring_ext and not pinky_ext:
             return "FIST"
 
         return "UNKNOWN"

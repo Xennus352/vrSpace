@@ -95,7 +95,7 @@ class VisionInteraction:
             p.highlight *= 0.6
 
         for label, (gesture, _lm) in hands.items():
-            if gesture in ("POINTING_UP", "POINTING", "LEFT_POINTING", "RIGHT_POINTING"):
+            if gesture.startswith("POINTING_"):
                 tip = self._tip_world.get(label)
                 if tip is None:
                     continue

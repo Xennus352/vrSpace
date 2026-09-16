@@ -35,11 +35,13 @@ class PassthroughRenderer:
         from glove_hand import GloveHand
         from vr_scene import VRWorld, VRPlayer
         from hologram import Hologram
+        from iron_man import IronManGame
         self.view = ViewSpace()
         self._glove = GloveHand(self.view)
         self.holo = Hologram(self.view)
         self._world = VRWorld()
         self.player = VRPlayer()
+        self.iron_man = IronManGame()
 
         # ---- Stereo headset (VR) state -------------------------------
         self.vr_enabled = True
@@ -183,6 +185,15 @@ class PassthroughRenderer:
     def update(self, dt, ctrl=None):
         self._glove.update(dt)
         self.holo.update(dt)
+
+        if self.iron_man.active:
+            # Iron Man VR drives its own flight/camera; keyboard still works
+            # as a fallback for non-gesture users.
+            aspect = float(self.viewport[0]) / max(1.0, float(self.viewport[1])) \
+                if self.viewport else 16.0 / 9.0
+            self.iron_man.update(dt, view=self.view, aspect=aspect)
+            return
+
         # Get gesture locomotion and merge with keyboard
         if ctrl is not None:
             gfwd, gright, gup = self.holo.get_locomotion()
@@ -211,10 +222,17 @@ class PassthroughRenderer:
     # ------------------------------------------------------------------
     def _apply_camera_fp(self, ipd=0.0):
         """First-person: player eye position + head rotation (+ eye offset)."""
-        yaw = self.player.facing + self._yaw
-        pitch = self.player.pitch + self._pitch
-        px, py, pz = self.player.pos
-        ey = self.player.eye_height + self.player.bob
+        if self.iron_man.active:
+            # Iron Man mode: the camera rides the flying suit
+            yaw = self.iron_man.facing + self._yaw
+            pitch = self.iron_man.pitch + self._pitch
+            px, py, pz = self.iron_man.pos
+            ey = 0.1   # roughly chest height of the suit (arc reactor viewpoint)
+        else:
+            yaw = self.player.facing + self._yaw
+            pitch = self.player.pitch + self._pitch
+            px, py, pz = self.player.pos
+            ey = self.player.eye_height + self.player.bob
         glLoadIdentity()
         glTranslatef(ipd, 0.0, 0.0)
         glRotatef(-math.degrees(pitch), 1.0, 0.0, 0.0)
@@ -249,6 +267,11 @@ class PassthroughRenderer:
         glRotatef(roll_deg, 0.0, 0.0, 1.0)
 
     def _world_draw(self, aspect):
+        if self.iron_man.active:
+            # Iron Man VR replaces the space station world entirely
+            self.iron_man.draw(aspect)
+            return
+
         px, _, pz = self.player.pos
         self._world.draw(
             live_texture=self._bg_texture,
@@ -261,6 +284,16 @@ class PassthroughRenderer:
 
     def _hud_draw(self, aspect, with_glove=True):
         """Render the HUD (glove + finger pointers) in view space."""
+        if self.iron_man.active:
+            # Iron Man HUD is drawn as a pygame overlay; only show the gauntlets
+            glMatrixMode(GL_MODELVIEW)
+            glPushMatrix()
+            glLoadIdentity()
+            if with_glove:
+                self._glove.render(aspect)
+            glPopMatrix()
+            return
+
         glMatrixMode(GL_MODELVIEW)
         glPushMatrix()
         glLoadIdentity()
@@ -277,7 +310,7 @@ class PassthroughRenderer:
 
         glClearColor(0.004, 0.008, 0.02, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        self._set_projection(aspect, 76.0, far=300.0)
+        self._set_projection(aspect, 76.0, far=400.0)
 
         self._apply_camera_fp()
 
@@ -306,7 +339,7 @@ class PassthroughRenderer:
             glScissor(x0, 0, half_w, h)
             glClear(GL_DEPTH_BUFFER_BIT)
             glDisable(GL_SCISSOR_TEST)
-            self._set_projection(eye_aspect, vr_fov, far=300.0)
+            self._set_projection(eye_aspect, vr_fov, far=400.0)
 
             self._apply_camera_fp(self._ipd if side == "L" else -self._ipd)
 

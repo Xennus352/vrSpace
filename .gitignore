@@ -1,0 +1,24 @@
+# Secrets — never commit real keys
+.env
+*.env
+.env.local
+*.pem
+*_key*
+*key*.json
+secrets.*
+credentials.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

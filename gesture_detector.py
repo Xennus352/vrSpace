@@ -44,6 +44,33 @@ class GestureDetector:
     def finger_up(self, tip, pip):
         return tip.y < pip.y
 
+    def _f_ext(self, landmarks, mcp_i, pip_i, tip_i):
+        """Direction-agnostic extension check: tip is far from MCP compared to
+        PIP (finger out straight in ANY direction, not just up)."""
+        mcp, pip, tip = landmarks[mcp_i], landmarks[pip_i], landmarks[tip_i]
+        ext = math.hypot(tip.x - mcp.x, tip.y - mcp.y, tip.z - mcp.z)
+        curl = math.hypot(pip.x - mcp.x, pip.y - mcp.y, pip.z - mcp.z)
+        return ext > curl * 1.15
+
+    def finger_extended(self, landmarks):
+        """Return True if index finger is extended in ANY direction (not curled)."""
+        return self._f_ext(landmarks, 5, 6, 8)
+
+    def pointing_direction(self, landmarks):
+        """Determine the dominant 2D direction the index finger points.
+        Returns 'UP', 'DOWN', 'LEFT', 'RIGHT', or None.
+        Uses MCP(5) -> TIP(8) vector in image space."""
+        mcp = landmarks[5]
+        tip = landmarks[8]
+        dx = tip.x - mcp.x
+        dy = tip.y - mcp.y
+        adx, ady = abs(dx), abs(dy)
+        if adx < 0.015 and ady < 0.015:
+            return None
+        if ady > adx:
+            return "DOWN" if dy > 0 else "UP"
+        return "RIGHT" if dx > 0 else "LEFT"
+
     def normalize_handedness(self, label):
         if not self.swap_handedness:
             return label
@@ -65,10 +92,11 @@ class GestureDetector:
         pinky_tip = landmarks[20]
         pinky_pip = landmarks[18]
 
-        index_up = self.finger_up(index_tip, index_pip)
-        middle_up = self.finger_up(middle_tip, middle_pip)
-        ring_up = self.finger_up(ring_tip, ring_pip)
-        pinky_up = self.finger_up(pinky_tip, pinky_pip)
+        # Direction-aware finger extension (works at ANY hand angle)
+        index_ext = self.finger_extended(landmarks)
+        middle_ext = self._f_ext(landmarks, 9, 10, 12)
+        ring_ext = self._f_ext(landmarks, 13, 14, 16)
+        pinky_ext = self._f_ext(landmarks, 17, 18, 20)
 
         if handedness == "Right":
             thumb_up = thumb_tip.x > thumb_ip.x
@@ -77,21 +105,22 @@ class GestureDetector:
 
         pinch_distance = self.distance(index_tip, thumb_tip)
 
-        if thumb_up and not index_up and not middle_up and not ring_up and not pinky_up:
+        if thumb_up and not index_ext and not middle_ext and not ring_ext and not pinky_ext:
             return "THUMBS_UP"
-        if index_up and middle_up and ring_up and pinky_up:
+        if index_ext and middle_ext and ring_ext and pinky_ext:
             return "OPEN_PALM"
         if pinch_distance < 0.05:
             return "CLICK"
-        if index_up and middle_up and not ring_up and not pinky_up:
+        if index_ext and middle_ext and not ring_ext and not pinky_ext:
             return "VICTORY"
-        if index_up and middle_up and ring_up and not pinky_up:
+        if index_ext and middle_ext and ring_ext and not pinky_ext:
             return "THREE_FINGER_CLICK"
-        if middle_up and not index_up and not ring_up and not pinky_up:
+        if middle_ext and not index_ext and not ring_ext and not pinky_ext:
             return "RIGHT_CLICK_G"
-        if index_up and not middle_up and not ring_up and not pinky_up:
-            return "POINTING_UP"
-        if not index_up and not middle_up and not ring_up and not pinky_up:
+        if index_ext and not middle_ext and not ring_ext and not pinky_ext:
+            direction = self.pointing_direction(landmarks)
+            return f"POINTING_{direction}" if direction else "POINTING_UP"
+        if not index_ext and not middle_ext and not ring_ext and not pinky_ext:
             return "FIST"
 
         return "UNKNOWN"

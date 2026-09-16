@@ -4,13 +4,15 @@ A floating, hand-manipulable hologram rendered in view space so it works over
 the live camera passthrough (AR) and inside the VR world (HUD layer) with
 no changes.
 
-Gestures (from gesture_detector.py):
-    FIST (one hand)     grab-space rotate: move the fist to spin it,
-                        release to let it keep spinning (inertia)
-    FIST both hands     two-hand zoom (Iron Man style: hands apart/together)
-    CLICK (pinch)       grab the hologram and drag it to a new spot
-    THUMBS_UP           switch hologram (crime scene / orbital atlas)
-    VICTORY             reset pose (position / rotation / scale)
+Gestures (Vision Pro style, from gesture_detector.py):
+    POINT (any direction)  aim the pointer at the hologram -> focus ring + glow
+    PINCH (CLICK)          grab it, drag it, release to drop (glides to rest)
+    PINCH both hands       pinch-zoom: spread apart = enlarge,
+                           bring together = shrink, twist to rotate
+    FIST (one hand)        grab-space rotate: move the fist to spin it,
+                           release to let it keep spinning (inertia)
+    THUMBS_UP              switch hologram (crime scene / orbital atlas)
+    VICTORY                reset pose (position / rotation / scale)
 
 Look: additive cyan wireframe with hot cores, per-vertex scanlines, lamp
 flicker, periodic glitch bands, emitter ring + light cone, scan sweep ring
@@ -342,10 +344,31 @@ class Hologram:
         self._th_center0 = np.zeros(3)
         self._th_yaw0 = 0.0
         self._th_scale0 = 1.0
-        # locomotion (Quest 3 style: pinch + hand direction)
+        # two-hand physics state
+        self._scale_vel = 0.0          # velocity used for scale momentum
+        self._scale_decay = 10.0       # damping (1/s) on the momentum
+        self._two_hand_t = 0.0         # time since two-hand grip grabbed
+        # Vision Pro grab / drag / drop physics
+        self._grab_vel = np.zeros(2, np.float64)    # hand drag velocity
+        self._drop_vel = np.zeros(2, np.float64)    # release glide velocity
+        self._dropping = False                      # object glides after drop
+        self._grab_spring = 24.0                    # critically-damped follow rate
+        self._drop_decay = 6.5                      # glide damping (1/s)
+        self._ptr_hit = {"Left": False, "Right": False}   # finger ray hits hologram
+        self._focused = False                       # any pointer aimed at hologram
+        # locomotion (Quest 3 style: pinch + hand direction) — DISABLED
         self._loco_hand = None
         self._loco_start = np.zeros(2)
         self._loco_vec = np.zeros(3)   # (fwd, right, up) in world space
+        # Tony-Stark pointer / input smoothing (EMA per hand, per frame)
+        self._smooth_j = {}            # label -> [tip, pip, mcp] (smoothed)
+        self._sm_tau = 0.055           # pointer joint EMA time constant (s)
+        # Two-hand input smoothing — stabilizes dist / mid / angle
+        self._em_mid = None            # smoothed midpoint
+        self._em_dist = None           # smoothed hand-span
+        self._em_angle = None          # smoothed angle
+        self._em_tau = 0.060           # scale/move input EMA time constant (s)
+        self._ptr_state = {}           # per-hand smoothed (pts,tip,pip,mcp) for the frame
         self._last_palms = 0.0
         self._last_hands_state = None
         self._t = 0.0
@@ -366,10 +389,75 @@ class Hologram:
         e, self._event = self._event, None
         return e
 
+    def next_scene(self):
+        """Switch to the next holographic scene (voice command)."""
+        if len(self.scenes) < 2:
+            return
+        self.scene_i = (self.scene_i + 1) % len(self.scenes)
+        self._event = f"hologram: {self.scenes[self.scene_i].get('name', 'scene')}"
+
+    def prev_scene(self):
+        """Switch to the previous holographic scene."""
+        if len(self.scenes) < 2:
+            return
+        self.scene_i = (self.scene_i - 1) % len(self.scenes)
+        self._event = f"hologram: {self.scenes[self.scene_i].get('name', 'scene')}"
+
+    def reset_pose(self):
+        """Reset hologram position/rotation/scale (like VICTORY gesture)."""
+        self._resetting = True
+
     def get_locomotion(self):
-        """Return (fwd, right, up) in [-1,1] for VR movement.
-        Called by renderer each frame to apply gesture-based locomotion."""
-        return (float(self._loco_vec[0]), float(self._loco_vec[1]), float(self._loco_vec[2]))
+        """Gesture locomotion is DISABLED for now (keyboard only)."""
+        return (0.0, 0.0, 0.0)
+
+    # ----------------------------------------------------------------------
+    #  Vision Pro: shared ray-hit math
+    # ----------------------------------------------------------------------
+    def _holo_volume(self):
+        """Center + radius of the hologram's grab/focus volume (view space)."""
+        c = np.array([self.center[0], self.center[1] + 0.55 * self.scale,
+                      self.center[2]], np.float64)
+        r = (0.35 + 0.9 * self.scale) * self.scale
+        return c, r
+
+    def _ray_hits_holo(self, origin, dir_unit, max_t):
+        """First forward intersection distance of a ray with the hologram
+        volume, or None. Handles the case where the fingertip is already
+        inside the volume (nearest positive root / far surface)."""
+        c, r = self._holo_volume()
+        oc = c - origin
+        a = float(np.dot(dir_unit, dir_unit))
+        b = float(np.dot(oc, dir_unit))          # -2b/2 of the quadratic
+        cc = float(np.dot(oc, oc) - r * r)
+        disc = b * b - a * cc
+        if disc <= 0.0:
+            return None
+        sq = math.sqrt(disc)
+        t_near = (b - sq) / a
+        t_far = (b + sq) / a
+        # Pick the nearest valid forward crossing. If origin is inside the
+        # volume t_near is negative — use the far-surface crossing instead so
+        # a finger touching the object still highlights it.
+        t = t_near if t_near > 0.015 else (t_far if t_far > 0.015 else None)
+        if t is not None and t < max_t:
+            return t
+        return None
+
+    def _smooth_joints(self, label, lm, aspect):
+        """Run each finger landmark through an exponential moving average so
+        the pointer aim is rock-stable instead of jittering with MediaPipe
+        noise. Returns (full_pts, smoothed_tip, smoothed_pip, smoothed_mcp)."""
+        pts, _ = self.view.hand_pose(lm, aspect)
+        raw = np.array([pts[8], pts[6], pts[5]], np.float64)
+        prev = self._smooth_j.get(label)
+        if prev is None:
+            sm = raw.copy()
+        else:
+            alpha = 1.0 - math.exp(-1.0 / (self._sm_tau * 30.0))
+            sm = prev + alpha * (raw - prev)
+        self._smooth_j[label] = sm.copy()
+        return pts, sm[0], sm[1], sm[2]   # pts, tip, pip, mcp
 
     # ----------------------------------------------------------------------
     #  interaction
@@ -414,52 +502,117 @@ class Hologram:
                 self._switch_to = (self.scene_i + 1) % len(self.scenes)
                 self._event = f"{label}: next hologram"
 
-        # TWO-HAND MANIPULATION (both CLICK anywhere)
+        # ---- Vision Pro pointer: does each hand's finger ray aim at the hologram? ----
+        # Joint positions are EMA-smoothed (Tony-Stark stable aim) and stored
+        # once per frame so grab math and the drawn ray always agree.
+        ptr_hit = {}
+        for label, (g, _p) in palms.items():
+            d = hands_state.get(label)
+            lm = d.get("landmarks") if d else None
+            if not lm or len(lm) < 21:
+                continue
+            pts, tip, pip, mcp = self._smooth_joints(label, lm, aspect)
+            self._ptr_state[label] = (pts, tip, pip, mcp)
+            dv = tip - mcp
+            if float(np.linalg.norm(dv)) < 1e-4:
+                dv = tip - pip
+            n = float(np.linalg.norm(dv))
+            if n < 1e-4:
+                continue
+            dvec = dv / n
+            rlen = 0.9
+            if g == "CLICK":
+                rlen = 0.6
+            elif g == "FIST":
+                rlen = 0.25
+            elif g.startswith("POINTING"):
+                rlen = 3.0
+            hit = self._ray_hits_holo(tip, dvec, rlen)
+            if hit is not None:
+                ptr_hit[label] = True
+        self._ptr_hit = ptr_hit
+        self._focused = bool(ptr_hit)
+
+        # drop smoothing for hands that left the frame
+        for lab in list(self._smooth_j.keys()):
+            if lab not in self._ptr_state:
+                del self._smooth_j[lab]
+                self._ptr_state.pop(lab, None)
+
+        # TWO-HAND MANIPULATION — Vision Pro pinch-zoom: BOTH hands must be
+        # PINCHED (CLICK) to take hold of the volume; two open palms do
+        # nothing so idle hands never scale the object.
+        # Spread the pinch apart enlarges, bring them together shrinks,
+        # twisting the pair rotates — all mapped 1:1 from the real motion.
         both_click = ("Left" in palms and "Right" in palms
                       and palms["Left"][0] == "CLICK" and palms["Right"][0] == "CLICK")
 
         if both_click:
             self._resetting = False
             self._rot_hand = None
-            self._grab_hand = None
+            self._grab_hand = None   # two-hand grip supersedes a single drag
+            self._dropping = False
 
-            tL, tR = tips["Left"], tips["Right"]
             pL, pR = palms["Left"][1], palms["Right"][1]
 
             # Initialize two-hand manipulation (no proximity requirement)
             if not self._two_hand:
                 self._two_hand = True
-                self._th_mid0 = (pL + pR) * 0.5
-                self._th_vec0 = pR - pL
-                self._th_dist0 = float(np.linalg.norm(self._th_vec0))
-                self._th_angle0 = math.atan2(self._th_vec0[1], self._th_vec0[0])
+                self._two_hand_t = 0.0
+                self._scale_vel = 0.0
+                raw_vec = pR - pL
+                raw_dist = max(0.05, float(np.linalg.norm(raw_vec)))
+                raw_angle = math.atan2(raw_vec[1], raw_vec[0])
+                self._em_mid = (pL + pR) * 0.5
+                self._em_dist = raw_dist
+                self._em_angle = raw_angle
+                self._th_mid0 = self._em_mid.copy()
+                self._th_vec0 = raw_vec
+                self._th_dist0 = self._em_dist
+                self._th_angle0 = self._em_angle
                 self._th_center0 = self.center.copy()
                 self._th_yaw0 = self.yaw
                 self._th_scale0 = self.scale
             else:
-                # Update transform from hand motion
-                mid = (pL + pR) * 0.5
-                vec = pR - pL
-                dist = float(np.linalg.norm(vec))
-                angle = math.atan2(vec[1], vec[0])
+                # Update transform from hand motion. Inputs (midpoint, hand
+                # span, twist angle) are EMA-smoothed so MediaPipe noise can't
+                # jerk the scale/rotation — zoom feels silky, not steppy.
+                self._two_hand_t += dt_h
+                raw_mid = (pL + pR) * 0.5
+                raw_vec = pR - pL
+                raw_dist = max(0.05, float(np.linalg.norm(raw_vec)))
+                raw_angle = math.atan2(raw_vec[1], raw_vec[0])
+                a = 1.0 - math.exp(-dt_h / self._em_tau)
+                self._em_mid = self._em_mid + a * (raw_mid - self._em_mid)
+                self._em_dist = self._em_dist + a * (raw_dist - self._em_dist)
+                self._em_angle = self._em_angle + a * (raw_angle - self._em_angle)
+                mid, dist, angle = self._em_mid, self._em_dist, self._em_angle
 
-                # Translation: follow midpoint
+                # Translation: follow the smoothed midpoint
                 dmid = mid - self._th_mid0
                 self.center[:2] = self._th_center0[:2] + dmid
 
-                # Rotation: relative angle change
+                # Rotation (Vision Pro): twisting the pinch hands rotates the object
                 dang = angle - self._th_angle0
                 dang = (dang + math.pi) % (2 * math.pi) - math.pi
                 self.yaw = self._th_yaw0 - dang * 1.5
 
-                # Scale: relative distance change
+                # Scale (Vision Pro): exact relative hand-span change,
+                # 1:1 lockstep — pull apart grows, push together shrinks.
                 if self._th_dist0 > 0.02:
-                    self._target_scale = float(np.clip(
-                        self._th_scale0 * dist / self._th_dist0,
-                        self.SCALE_MIN, self.SCALE_MAX))
+                    target = self._th_scale0 * dist / self._th_dist0
+                    target = float(np.clip(target, self.SCALE_MIN, self.SCALE_MAX))
+                    self._scale_vel = 0.65 * self._scale_vel + \
+                        0.35 * ((target - self.scale) / max(dt_h, 1e-3))
+                    if self._two_hand_t > 0.035:
+                        # Ease toward the target (~2 frames) — cancels the
+                        # last trace of jitter without fighting the hands.
+                        self._target_scale = target
+                        self.scale += (target - self.scale) * min(1.0, dt_h * 28.0)
         else:
             if self._two_hand:
                 self._two_hand = False
+                self._em_mid = self._em_dist = self._em_angle = None
 
         # SINGLE-HAND OPS (only when not two-hand)
         if not self._two_hand:
@@ -487,7 +640,9 @@ class Hologram:
             else:
                 self._rot_hand = None
 
-            # Grab/move with single CLICK (index tip)
+            # Vision Pro grab/drag/drop with a single CLICK pinch.
+            # You may pinch the hologram directly (finger near it) or simply
+            # POINT at it and pinch — the pointer aim counts as the grab.
             if self._grab_hand is None:
                 for label in ("Left", "Right"):
                     if label in palms and palms[label][0] == "CLICK":
@@ -495,9 +650,12 @@ class Hologram:
                         c = self.center
                         dx = t[0] - c[0]
                         dy = t[1] - (c[1] + 0.55 * self.scale)
-                        if math.hypot(dx, dy) < 0.35 + 0.9 * self.scale:
+                        proximal = math.hypot(dx, dy) < 0.35 + 0.9 * self.scale
+                        if proximal or self._ptr_hit.get(label):
                             self._grab_hand = label
                             self._grab_off = t - c[:2]
+                            self._grab_vel[:] = 0.0
+                            self._dropping = False
                             self._resetting = False
                             self._event = f"{label}: hologram grabbed"
                         break
@@ -505,49 +663,54 @@ class Hologram:
                 g2 = palms.get(self._grab_hand)
                 if g2 is not None and g2[0] == "CLICK":
                     t = tips[self._grab_hand]
-                    self.center[0] = np.clip(t[0] - self._grab_off[0], -2.5, 2.5)
-                    self.center[1] = np.clip(t[1] - self._grab_off[1], -1.0, 0.5)
+                    target = t - self._grab_off
+                    # critically-damped spring follow → smooth, no teleporting
+                    k = min(1.0, self._grab_spring * max(dt_h, 1e-3))
+                    nx = self.center[0] + (target[0] - self.center[0]) * k
+                    ny = self.center[1] + (target[1] - self.center[1]) * k
+                    self._grab_vel[0] = (nx - self.center[0]) / max(dt_h, 1e-3)
+                    self._grab_vel[1] = (ny - self.center[1]) / max(dt_h, 1e-3)
+                    self.center[0] = np.clip(nx, -2.5, 2.5)
+                    self.center[1] = np.clip(ny, -1.0, 0.5)
                 else:
+                    # Vision Pro drop: release keeps the drag velocity and the
+                    # object glides to a stop (soft inertia, damped).
+                    self._drop_vel = self._grab_vel.copy()
+                    self._dropping = bool(np.linalg.norm(self._drop_vel) > 0.03)
                     self._grab_hand = None
+                    self._event = "hologram dropped"
 
-        # LOCOMOTION (Quest 3 style: pinch + hand direction)
-        # Start: CLICK on empty space (not on hologram) -> set loco hand
-        # Move: while pinched, hand offset from start gives fwd/right/up
-        # Release: stop
-        loco_candidate = None
-        for label in ("Left", "Right"):
-            if label in palms and palms[label][0] == "CLICK":
-                # Check if NOT grabbing hologram
-                t = tips[label]
-                c = self.center
-                d = math.hypot(t[0] - c[0], t[1] - (c[1] + 0.55 * self.scale))
-                if d >= 0.35 + 0.9 * self.scale:
-                    loco_candidate = label
-                    break
-        if loco_candidate is not None:
-            if self._loco_hand is None:
-                self._loco_hand = loco_candidate
-                self._loco_start = tips[loco_candidate].copy()
-            elif self._loco_hand == loco_candidate:
-                # Compute offset from start (normalized view coords)
-                cur = tips[loco_candidate]
-                dx = cur[0] - self._loco_start[0]
-                dy = cur[1] - self._loco_start[1]
-                # Map to world: dy -> forward/back, dx -> left/right
-                # Scale sensitivity
-                self._loco_vec[0] = np.clip(-dy * 3.0, -1.0, 1.0)   # forward
-                self._loco_vec[1] = np.clip(-dx * 3.0, -1.0, 1.0)   # right
-                # Pinch depth (z) for up/down - use thumb-index distance
-                lm = hands_state[loco_candidate].get("landmarks")
-                if lm and len(lm) >= 21:
-                    pts, _ = self.view.hand_pose(lm, aspect)
-                    pinch = math.hypot(pts[4][0] - pts[8][0], pts[4][1] - pts[8][1])
-                    # Pinch tighter -> up, looser -> down (inverted)
-                    self._loco_vec[2] = np.clip((0.05 - pinch) * 10.0, -1.0, 1.0)
-        else:
-            if self._loco_hand is not None:
-                self._loco_hand = None
-                self._loco_vec[:] = 0.0
+        # LOCOMOTION by hand gesture — DISABLED (re-enable by uncommenting).
+        # Quest 3 style: pinch + hand direction moves the player.
+        # loco_candidate = None
+        # if not self._two_hand and self._grab_hand is None:
+        #     for label in ("Left", "Right"):
+        #         if label in palms and palms[label][0] == "CLICK":
+        #             t = tips[label]
+        #             c = self.center
+        #             d = math.hypot(t[0] - c[0], t[1] - (c[1] + 0.55 * self.scale))
+        #             if d >= 0.35 + 0.9 * self.scale:
+        #                 loco_candidate = label
+        #                 break
+        # if loco_candidate is not None:
+        #     if self._loco_hand is None:
+        #         self._loco_hand = loco_candidate
+        #         self._loco_start = tips[loco_candidate].copy()
+        #     elif self._loco_hand == loco_candidate:
+        #         cur = tips[loco_candidate]
+        #         dx = cur[0] - self._loco_start[0]
+        #         dy = cur[1] - self._loco_start[1]
+        #         self._loco_vec[0] = np.clip(-dy * 3.0, -1.0, 1.0)   # forward
+        #         self._loco_vec[1] = np.clip(-dx * 3.0, -1.0, 1.0)   # right
+        #         lm = hands_state[loco_candidate].get("landmarks")
+        #         if lm and len(lm) >= 21:
+        #             pts, _ = self.view.hand_pose(lm, aspect)
+        #             pinch = math.hypot(pts[4][0] - pts[8][0], pts[4][1] - pts[8][1])
+        #             self._loco_vec[2] = np.clip((0.05 - pinch) * 10.0, -1.0, 1.0)
+        # else:
+        #     if self._loco_hand is not None:
+        #         self._loco_hand = None
+        #         self._loco_vec[:] = 0.0
 
         # update prev
         for label in ("Left", "Right"):
@@ -587,8 +750,29 @@ class Hologram:
         tgt = 1.0 if self.visible else 0.0
         self._vis += (tgt - self._vis) * min(1.0, dt * 5.0)
 
-        # scale easing
-        self.scale += (self._target_scale - self.scale) * min(1.0, dt * 9.0)
+        # scale easing (+ momentum from two-hand gestures)
+        if not self._two_hand and abs(self._scale_vel) > 0.001:
+            # Real-world physics: released scale keeps moving, damped to rest
+            self.scale = float(np.clip(
+                self.scale + self._scale_vel * dt, self.SCALE_MIN, self.SCALE_MAX))
+            self._target_scale = self.scale
+            self._scale_vel *= math.exp(-self._scale_decay * dt)
+            if abs(self._scale_vel) < 0.01:
+                self._scale_vel = 0.0
+        else:
+            # fast critically-damped convergence when actively scaled by hands
+            k = min(1.0, dt * (17.0 if self._two_hand else 9.0))
+            self.scale += (self._target_scale - self.scale) * k
+
+        # Vision Pro drop: after release the hologram glides with the drag
+        # velocity, then eases to rest inside its allowed bounds.
+        if self._dropping:
+            self.center[0] = np.clip(self.center[0] + self._drop_vel[0] * dt, -2.5, 2.5)
+            self.center[1] = np.clip(self.center[1] + self._drop_vel[1] * dt, -1.0, 0.5)
+            self._drop_vel *= math.exp(-self._drop_decay * dt)
+            if np.linalg.norm(self._drop_vel) < 0.015:
+                self._drop_vel[:] = 0.0
+                self._dropping = False
 
         # reset animation
         if self._resetting:
@@ -665,16 +849,26 @@ class Hologram:
             if not lm or len(lm) < 21:
                 continue
             g = d.get("gesture", "IDLE")
-            pts, _ = self.view.hand_pose(lm, aspect)
+
+            # Reuse the per-frame EMA-smoothed joints computed in handle_hands
+            # so the drawn ray is identical to the grab/focus math.
+            state = self._ptr_state.get(label)
+            if state is None:
+                continue
+            full_pts, tip, pip, mcp = state
 
             # Index finger: MCP (5) -> PIP (6) -> DIP (7) -> TIP (8)
-            # Build smooth curve through finger joints
-            finger_joints = [np.array(pts[i]) for i in (5, 6, 7, 8)]
+            # Build the smooth joint curve from the smoothed base + dip.
+            finger_joints = [np.asarray(mcp), np.asarray(pip),
+                             np.asarray(full_pts[7]), np.asarray(tip)]
             base = finger_joints[0]
             tip = finger_joints[-1]
 
-            # Direction from PIP to TIP (more stable than MCP->TIP)
-            dir_vec = tip - finger_joints[1]
+            # Direction: MCP->TIP keeps a long, stable baseline for ANY aim
+            # (including pointing straight at the camera where PIP~TIP fold).
+            dir_vec = tip - base
+            if np.linalg.norm(dir_vec) < 1e-4:
+                dir_vec = tip - finger_joints[1]
             norm = np.linalg.norm(dir_vec)
             if norm < 1e-4:
                 continue
@@ -687,25 +881,33 @@ class Hologram:
             elif g == "FIST":
                 ray_len = 0.25
                 base_color = C_DIM
-            else:
+            elif g.startswith("POINTING"):
                 ray_len = 3.0
                 base_color = C_HOT
+            else:
+                ray_len = 0.9
+                base_color = C_CYAN
 
-            # Check intersection with hologram bounds for visual feedback
-            hologram_center = np.array([self.center[0], self.center[1] + 0.55 * self.scale, self.center[2]])
-            hologram_radius = (0.35 + 0.9 * self.scale) * self.scale
-            # Ray-plane intersection with hologram mid-plane
-            to_center = hologram_center - tip
-            denom = np.dot(dir_vec, np.array([0, 1, 0]))  # vertical plane
-            hit_dist = None
-            if abs(denom) > 1e-4:
-                d = np.dot(to_center, np.array([0, 1, 0])) / denom
-                if 0 < d < ray_len:
-                    hit_dist = d
+            # True 3D ray/sphere intersection against the hologram's grab
+            # volume (matches the 2D grab hit-test circle). Works for ANY aim
+            # direction — up, down, left, right — and gives an exact hit point.
+            hit_dist = self._ray_hits_holo(tip, dir_vec, ray_len)
 
-            # Shorten ray if hitting hologram
+            # Secondary test: ray vs the scene ground plane (y = center[1]).
+            # Lets a down-pointing finger place the cursor EXACTLY on the
+            # crime-scene table/floor instead of past it into the void.
+            ground_y = self.center[1]
+            if dir_vec[1] < -0.02:
+                t_ground = (ground_y - tip[1]) / dir_vec[1]
+                if 0.015 < t_ground < ray_len and t_ground > 0:
+                    if hit_dist is None or t_ground < hit_dist:
+                        hit_dist = t_ground
+
+            # Shorten ray to the exact hit surface <-> accurate cursor; the
+            # pointer is ON the object, exactly like Apple Vision Pro.
             if hit_dist is not None:
-                ray_len = min(ray_len, hit_dist * 1.05)
+                self._ptr_hit[label] = True
+                ray_len = hit_dist
                 base_color = C_AMBER  # highlight on target
 
             end = tip + dir_vec * ray_len
@@ -745,6 +947,16 @@ class Hologram:
                 segs.append(((end[0] - dot_sz, end[1], end[2]), (end[0] + dot_sz, end[1], end[2]), base_color, 1.0))
                 segs.append(((end[0], end[1] - dot_sz, end[2]), (end[0], end[1] + dot_sz, end[2]), base_color, 1.0))
                 segs.append(((end[0], end[1], end[2] - dot_sz), (end[0], end[1], end[2] + dot_sz), base_color, 1.0))
+
+                # ---- Vision Pro focus ring: contact sheen on the object ----
+                if hit_dist is not None:
+                    rr = 0.028 + 0.006 * math.sin(t * 9.0)   # breathing ring
+                    for k in range(8):
+                        a0 = 2 * math.pi * k / 8
+                        a1 = 2 * math.pi * (k + 1) / 8
+                        p0 = end + perp1 * (rr * math.cos(a0)) + perp2 * (rr * math.sin(a0))
+                        p1 = end + perp1 * (rr * math.cos(a1)) + perp2 * (rr * math.sin(a1))
+                        segs.append((tuple(p0), tuple(p1), C_AMBER, 0.85))
 
             # ---- Finger joint trail (subtle) ----
             for i in range(3):
@@ -888,6 +1100,8 @@ class Hologram:
         flick = 0.88 + 0.12 * math.sin(t * 61.0) * math.sin(t * 7.7)
         glitch = t < self._glitch_until
         A = self._vis * self._fade * flick
+        if self._focused:
+            A *= 1.18   # Vision Pro focus emphasis when a pointer aims at it
         if glitch:
             A *= float(self._rng.uniform(0.55, 1.05))
 
@@ -1027,6 +1241,8 @@ class Hologram:
         flick = 0.88 + 0.12 * math.sin(t * 61.0) * math.sin(t * 7.7)
         glitch = t < self._glitch_until
         A = self._vis * self._fade * flick
+        if self._focused:
+            A *= 1.18   # Vision Pro focus emphasis when a pointer aims at it
         if glitch:
             A *= float(self._rng.uniform(0.55, 1.05))
 

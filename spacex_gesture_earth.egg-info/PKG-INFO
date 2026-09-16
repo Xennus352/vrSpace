@@ -11,3 +11,7 @@ Requires-Dist: opencv-python>=4.8.0
 Requires-Dist: numpy>=1.24.0
 Requires-Dist: Pillow>=10.0.0
 Requires-Dist: pyttsx3>=2.90
+Requires-Dist: websockets>=16.1.1
+Requires-Dist: elevenlabs>=2.68.0
+Requires-Dist: openai>=3.13.0
+Requires-Dist: requests>=2.34.2
